@@ -616,15 +616,23 @@ def get_tile_diff(dataset_id: str, request: Request) -> JSONResponse:
     from_revision, to_revision : positive revision numbers (both must exist)
     z                          : zoom level, 0-14
 
-    The candidate range is derived from the mercator bounds of every feature
-    of both revisions, expanded by the same 8 px buffer used when clipping,
-    so added / removed / moved / attribute-changed features and buffer-only
-    neighbours are all covered (ID-less and duplicate-ID features included).
-    Each candidate is then resolved through the exact projection / clip /
-    simplify / quantise / MVT pipeline and adjudicated by *encoded bytes*:
-    tiles that stay byte-identical even when the source GeoJSON differs are
-    not reported.  ``from_etag`` / ``to_etag`` are the very ETags returned by
-    the pinned tile endpoint.  Results are sorted by ``x`` then ``y``.
+    Features present (geometry *and* typed properties) and ordered
+    identically in both revisions never affect a tile, so they contribute no
+    candidates: ``tilediff.changed_features`` pairs the two feature lists by
+    the encoder's own sort key -- content hash for ID-less features, so no-ID
+    and duplicate-ID features never collapse -- and pairs equal-key features
+    positionally, so a reorder of same-key features (which changes MVT bytes)
+    is not falsely cancelled.  Only unmatched features (additions, deletions,
+    moves, property edits, identity reorders) then drive candidates: their
+    mercator bounds are grown by the same 8 px buffer used when clipping, so
+    a moved point's old *and* new buffer neighbours are all covered while a
+    globe-spanning polygon present in both revisions does not force a global
+    enumeration at z=14.  Each candidate is resolved through the exact
+    projection / clip / simplify / quantise / MVT pipeline and adjudicated
+    by *encoded bytes*: tiles that stay byte-identical even when the source
+    GeoJSON differs are not reported.  ``from_etag`` / ``to_etag`` are the
+    very ETags returned by the pinned tile endpoint.  Results are sorted by
+    ``x`` then ``y``.
     """
     params = request.query_params
     try:

@@ -435,11 +435,35 @@ def test_candidate_superset_exhaustive_across_zooms():
 
 
 def test_candidate_tiles_cover_buffer_neighbours():
-    feats = _as_shapely_features([point(NEAR_BOUNDARY_WEST, 10.0, fid=1)])
-    candidates = tilediff.candidate_tiles(feats, feats, 3)
+    # Revision 1 holds the near-boundary point; revision 2 removes it (a
+    # far-away replacement keeps the collection non-empty).  Unmatched
+    # features drive the candidate set, so the containing tile *and* the
+    # 8 px buffered neighbour of the deleted point are enumerated.
+    feats_a = _as_shapely_features([point(NEAR_BOUNDARY_WEST, 10.0, fid=1)])
+    feats_b = _as_shapely_features([point(2.0, 2.0, fid=2)])
+    candidates = tilediff.candidate_tiles(feats_a, feats_b, 3)
     # Containing tile (6,3) plus the 8 px buffered neighbour (7,3).
     assert (6, 3) in candidates
     assert (7, 3) in candidates
+
+
+def test_identical_revisions_have_no_candidates():
+    # Every feature pairs with an identical counterpart: nothing may move,
+    # so no tile is enumerated at all (the endpoint skips this case anyway).
+    feats = _as_shapely_features(
+        [
+            point(10.0, 10.0, {"k": 1}, fid=1),
+            point(-50.0, 5.0, {"k": 2}, fid="s"),
+            polygon(
+                [[[-179, -80], [179, -80], [179, 80], [-179, 80], [-179, -80]]],
+                {"kind": "land"},
+                fid=9,
+            ),
+        ]
+    )
+    assert tilediff.candidate_tiles(feats, feats, 14) == []
+    changed_a, changed_b = tilediff.changed_features(feats, feats)
+    assert changed_a == [] and changed_b == []
 
 
 def test_candidate_tiles_union_both_revisions_and_sorted():
@@ -475,6 +499,191 @@ def test_z14_endpoint_diff_is_small_for_local_update(client):
     _publish_next(client, ds, [point(lng + 0.0003, lat, fid=1)], 1)
     changed = _diff(client, ds, 1, 2, 14).json()["changed_tiles"]
     assert 1 <= len(changed) <= 2
+
+
+def world_polygon(fid=9, props=None):
+    """A valid polygon covering essentially the whole globe."""
+    return polygon(
+        [[[-179.0, -80.0], [179.0, -80.0], [179.0, 80.0],
+          [-179.0, 80.0], [-179.0, -80.0]]],
+        props if props is not None else {"kind": "land"},
+        fid=fid,
+    )
+
+
+def test_z14_global_polygon_plus_local_point_move_enumerates_locally():
+    # Both revisions keep a globe-spanning polygon; only one local point
+    # moves ~30 m.  Pre-fix the polygon bbox expanded the candidate set to
+    # the whole z14 grid (2**28 tiles, OOM); post-fix only the point's old
+    # and new buffered neighbourhoods are enumerated.
+    lng, lat = 116.4074, 39.9042
+    rev1 = _as_shapely_features([world_polygon(), point(lng, lat, fid=1)])
+    rev2 = _as_shapely_features(
+        [world_polygon(), point(lng + 0.0003, lat, fid=1)]
+    )
+
+    candidates = tilediff.candidate_tiles(rev1, rev2, 14)
+    assert 1 <= len(candidates) <= 4
+    x = int((lng + 180) / 360 * (1 << 14))
+    for cx, cy in candidates:
+        assert abs(cx - x) <= 1
+
+    # The global polygon alone (identical in both revisions) enumerates
+    # nothing at any zoom.
+    same = _as_shapely_features([world_polygon()])
+    assert tilediff.candidate_tiles(same, same, 14) == []
+    assert tilediff.candidate_tiles(same, same, 0) == []
+
+
+def test_z14_endpoint_global_polygon_plus_local_move_is_fast_and_exact(client):
+    lng, lat = 116.4074, 39.9042
+    rev1 = [world_polygon(), point(lng, lat, {"name": "p"}, fid=1)]
+    rev2 = [world_polygon(), point(lng + 0.0003, lat, {"name": "p"}, fid=1)]
+    ds = _publish_one(client, rev1)
+    _publish_next(client, ds, rev2, 1)
+
+    import time
+
+    t0 = time.monotonic()
+    resp = _diff(client, ds, 1, 2, 14)
+    elapsed = time.monotonic() - t0
+    assert resp.status_code == 200
+    assert elapsed < 10.0, "diff must not walk the global z14 grid"
+
+    tiles = resp.json()["changed_tiles"]
+    # The moved point changes only its local tile(s); the polygon is unchanged.
+    assert 1 <= len(tiles) <= 4
+    x = int((lng + 180) / 360 * (1 << 14))
+    for t in tiles:
+        assert abs(t["x"] - x) <= 1
+        assert t["from_etag"] != t["to_etag"]
+
+    # The manifest must agree with an exhaustive compile around the change,
+    # and a far-away global tile must be byte-identical across revisions.
+    far = client.get("/datasets/%s/tiles/14/0/0.mvt?revision=1" % ds)
+    far2 = client.get("/datasets/%s/tiles/14/0/0.mvt?revision=2" % ds)
+    assert far.status_code == far2.status_code == 200
+    assert far.content == far2.content
+    assert far.headers["etag"] == far2.headers["etag"]
+
+
+def test_global_polygon_movement_is_still_detected():
+    # When the *polygon* itself changes (a vertex nudged), its global range
+    # legitimately dominates -- correctness over locality.
+    rev1 = _as_shapely_features([world_polygon(), point(116.4074, 39.9042, fid=1)])
+    moved = world_polygon()
+    moved["geometry"] = shape(
+        polygon(
+            [[[-178.0, -80.0], [179.0, -80.0], [179.0, 80.0],
+              [-178.0, 80.0], [-178.0, -80.0]]]
+        )["geometry"]
+    )
+    rev2 = _as_shapely_features([moved, point(116.4074, 39.9042, fid=1)])
+    changed_a, changed_b = tilediff.changed_features(rev1, rev2)
+    assert len(changed_a) == 1 and len(changed_b) == 1
+    assert changed_a[0]["id"] == changed_b[0]["id"] == 9
+
+
+# ---------------------------------------------------------------------------
+# Cross-revision feature correspondence
+# ---------------------------------------------------------------------------
+
+
+def test_correspondence_without_ids_matches_by_content():
+    base = _as_shapely_features(
+        [point(10.0, 10.0, {"k": "a"}), point(-20.0, 20.0, {"k": "b"})]
+    )
+    # Same two ID-less features in reversed source order: encoder order is by
+    # content hash, so every feature still pairs identically.
+    reordered = list(reversed(base))
+    changed_a, changed_b = tilediff.changed_features(base, reordered)
+    assert changed_a == [] and changed_b == []
+
+
+def test_correspondence_duplicate_ids_reorder_is_a_change():
+    # Two features sharing ID 7; swapping their source order changes the
+    # emitted MVT (the encoder sorts stably, so the equal sort key keeps
+    # source order).  Positional pairing must NOT cancel them.
+    a = _as_shapely_features(
+        [point(10.0, 10.0, {"name": "a"}, fid=7),
+         point(10.0, 11.0, {"name": "b"}, fid=7)]
+    )
+    b = _as_shapely_features(
+        [point(10.0, 11.0, {"name": "b"}, fid=7),
+         point(10.0, 10.0, {"name": "a"}, fid=7)]
+    )
+    changed_a, changed_b = tilediff.changed_features(a, b)
+    assert len(changed_a) == 2 and len(changed_b) == 2
+
+
+def test_correspondence_duplicate_string_ids_reorder_is_a_change():
+    a = _as_shapely_features(
+        [point(10.0, 10.0, {"name": "a"}, fid="x"),
+         point(10.0, 11.0, {"name": "b"}, fid="x")]
+    )
+    b = _as_shapely_features(
+        [point(10.0, 11.0, {"name": "b"}, fid="x"),
+         point(10.0, 10.0, {"name": "a"}, fid="x")]
+    )
+    changed_a, changed_b = tilediff.changed_features(a, b)
+    assert len(changed_a) == 2 and len(changed_b) == 2
+
+
+def test_correspondence_equal_key_identical_content_swap_cancels():
+    # Equal sort key *and* equal content: swapping identical copies changes
+    # no bytes anywhere, so cancelling is correct.
+    a = _as_shapely_features(
+        [point(10.0, 10.0, {"name": "a"}, fid=7),
+         point(10.0, 10.0, {"name": "a"}, fid=7)]
+    )
+    b = list(reversed(a))
+    changed_a, changed_b = tilediff.changed_features(a, b)
+    assert changed_a == [] and changed_b == []
+
+
+def test_correspondence_bool_vs_int_property_is_a_change():
+    # JSON true and integer 1 encode to different MVT value types: they must
+    # never be treated as the same property.
+    a = _as_shapely_features([point(10.0, 10.0, {"open": True}, fid=1)])
+    b = _as_shapely_features([point(10.0, 10.0, {"open": 1}, fid=1)])
+    changed_a, changed_b = tilediff.changed_features(a, b)
+    assert len(changed_a) == 1 and len(changed_b) == 1
+
+
+def test_correspondence_add_delete_and_move():
+    a = _as_shapely_features(
+        [point(10.0, 10.0, fid=1), point(-40.0, 20.0, fid=2),
+         point(5.0, 5.0, fid="gone")]
+    )
+    b = _as_shapely_features(
+        [point(12.0, 10.0, fid=1), point(-40.0, 20.0, fid=2),
+         point(70.0, -30.0, fid="new")]
+    )
+    changed_a, changed_b = tilediff.changed_features(a, b)
+    ids_a = sorted((f["id"] for f in changed_a), key=str)
+    ids_b = sorted((f["id"] for f in changed_b), key=str)
+    assert ids_a == [1, "gone"]
+    assert ids_b == [1, "new"]
+
+
+def test_reorder_of_same_key_features_is_reported(client):
+    # Endpoint-level: reordering two distinct, duplicate-ID features at the
+    # same location changes MVT bytes, and the local tile must be reported.
+    rev1 = [
+        point(10.0, 10.0, {"v": "a"}, fid=7),
+        point(10.0, 10.0, {"v": "b"}, fid=7),
+    ]
+    rev2 = [
+        point(10.0, 10.0, {"v": "b"}, fid=7),
+        point(10.0, 10.0, {"v": "a"}, fid=7),
+    ]
+    ds = _publish_one(client, rev1)
+    _publish_next(client, ds, rev2, 1)
+    changed = _diff(client, ds, 1, 2, 6).json()["changed_tiles"]
+    expected = _brute_force_changed_tiles(client, ds, 1, 2, 6)
+    got = {(t["x"], t["y"]) for t in changed}
+    assert got == expected
+    assert expected
 
 
 # ---------------------------------------------------------------------------
