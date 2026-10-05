@@ -1,0 +1,77 @@
+{
+  "type": "FeatureCollection",
+  "name": "tiny-polygon-demo",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1,
+      "properties": {"name": "Tiny triangle (~0.1 mm)"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [116.4074, 39.9042],
+            [116.407401, 39.9042],
+            [116.407401, 39.904201],
+            [116.4074, 39.9042]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 2,
+      "properties": {"name": "Beijing HQ", "kind": "capital"},
+      "geometry": {"type": "Point", "coordinates": [116.4074, 39.9042]}
+    },
+    {
+      "type": "Feature",
+      "id": 3,
+      "properties": {"name": "Rectangle with a tiny hole"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [100.0, 10.0],
+            [110.0, 10.0],
+            [110.0, 20.0],
+            [100.0, 20.0],
+            [100.0, 10.0]
+          ],
+          [
+            [105.0, 15.0],
+            [105.000001, 15.0],
+            [105.000001, 15.000001],
+            [105.0, 15.0]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 4,
+      "properties": {"name": "MultiPolygon with a tiny part"},
+      "geometry": {
+        "type": "MultiPolygon",
+        "coordinates": [
+          [
+            [
+              [116.4074, 39.9042],
+              [116.407401, 39.9042],
+              [116.407401, 39.904201],
+              [116.4074, 39.9042]
+            ]
+          ],
+          [
+            [
+              [120.0, 30.0],
+              [121.0, 30.0],
+              [120.5, 31.0],
+              [120.0, 30.0]
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

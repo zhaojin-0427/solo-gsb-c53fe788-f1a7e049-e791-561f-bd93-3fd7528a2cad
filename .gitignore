@@ -1,0 +1,11 @@
+.venv/
+.pydeps/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.init.lock
+*.init.lock
+*.egg-info/
