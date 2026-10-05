@@ -16,7 +16,7 @@
 | 乐观并发控制 | 发布新版本必须携带 `expected_revision`，与当前 head 不一致时返回 **409 Conflict**；head 比较、revision 插入与 head 更新在单个跨进程有效的 `BEGIN IMMEDIATE` 事务内原子完成，多 worker 并发追加也只有一方成功 |
 | 瓦片编译 | `GET /datasets/{id}/tiles/{z}/{x}/{y}.mvt`，支持 **z = 0–14** 的 XYZ 瓦片 |
 | 点选（identify） | `GET /datasets/{id}/tiles/{z}/{x}/{y}/identify?px=&py=&radius_px=[&revision=]`，在瓦片内点击处（源像素 `0≤px,py<256`、半径 `0–8 px`）按**编译后可见几何**裁决命中：面内距离为 0，线 / 点须落在圆形半径内；逐源要素编译，**保留 0 基源序号**与 4096 网格上的**亚像素点击位置**，无 ID / 字符串 ID / 重复 ID 不合并、量化后消失的几何不命中、缓冲边缘按同半径裁决，结果按距离再按源序号排序（见 [§4.9](#49-点选identify)） |
-| 离线增量清单 | `GET /datasets/{id}/tile-diff?from_revision=&to_revision=&z=`，按 **x、y 升序**返回两个修订间**实际 MVT 字节发生变化**的瓦片坐标及两端 ETag（ETag 与钉版瓦片逐字节一致）；候选范围由两份 GeoJSON 的全部要素几何（含无 ID / 重复 ID）外扩 **8 px 缓冲**求并集得到，新增 / 删除 / 移动 / 属性变化及缓冲邻瓦片都不漏报，源文档不同但瓦片编码相同不报，**z=14 局部更新只枚举局部邻瓦片** |
+| 离线增量清单 | `GET /datasets/{id}/tile-diff?from_revision=&to_revision=&z=`，按 **x、y 升序**返回两个修订间**实际 MVT 字节发生变化**的瓦片坐标及两端 ETag（ETag 与钉版瓦片逐字节一致）；候选范围先把两版要素**按编码排序键分组、组内按源顺序配对**，仅字节级完全一致才抵消（无 ID / 重复 ID / 同排序键换序都不会误抵消），只有抵消不掉的新增 / 删除 / 移动 / 属性变化要素以其几何外扩 **8 px 缓冲**（含旧、新位置）送入枚举，因此**两版都保留覆盖全球的面时，局部 z=14 更新也只枚举该局部邻瓦片**；源文档不同但瓦片编码相同不报 |
 | 投影 | EPSG:4326 经纬度 → 球面 Web Mercator（R = 6378137），瓦片内坐标系为 4096 网格、Y 轴向下 |
 | 8 像素缓冲裁剪 | 点 / 线 / 面先裁剪到瓦片外扩 **8 px（128/4096 单位）**的边界，保证跨瓦片连续 |
 | 0.5 px 拓扑简化 | 以 **0.5 px（8/4096 单位）**容差做保拓扑 Douglas–Peucker 简化 |
@@ -38,7 +38,7 @@
 │   ├── main.py          # FastAPI 路由：发布、版本、瓦片、点选、瓦片增量清单、错误处理
 │   ├── tiler.py         # 裁剪 / 简化 / 量化 / 稳定排序 / MVT 编码
 │   ├── identify.py      # 点选裁决：逐源编译可见几何，按到亚像素点击点的距离判定命中
-│   ├── tilediff.py      # 瓦片增量候选集：几何 mercator 包围盒外扩 8 px 求并集
+│   ├── tilediff.py      # 瓦片增量候选集：跨版要素配对抵消后，仅未抵消要素的包围盒外扩 8 px 求并集
 │   ├── projection.py    # EPSG:4326 -> Web Mercator -> 瓦片 4096 网格
 │   ├── geojson.py       # GeoJSON 校验与规范化
 │   ├── db.py            # SQLite 存储（datasets / revisions / tile_cache，非阻塞跨进程建库锁与事务）
@@ -47,10 +47,12 @@
 │   ├── sample.geojson          # 示例图层（点 / 线 / 面）
 │   ├── tiny-polygon.geojson    # 退化小多边形复核 revision 1（含 ~0.1 mm 小三角，见 §4.8）
 │   ├── tiny-polygon-v2.geojson # 复核 revision 2：删除小三角、点属性改名
-│   └── tiny-polygon-v3.geojson # 复核 revision 3：仅把小三角加回（瓦片与 v2 逐字节相同）
+│   ├── tiny-polygon-v3.geojson # 复核 revision 3：仅把小三角加回（瓦片与 v2 逐字节相同）
+│   ├── local-update-v1.geojson # 局部更新复核 revision 1：全球背景面 + 北京点（见 §4.6）
+│   └── local-update-v2.geojson # 复核 revision 2：背景面不变，北京点东移 ~30 m
 ├── scripts/
 │   └── hold_init_lock.py # 持锁复核辅助：独占 <db>.init.lock（可定时释放）
-├── tests/               # pytest 测试（134 个用例，含点选裁决、瓦片增量清单、量化坍缩环裁决、非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
+├── tests/               # pytest 测试（140 个用例，含点选裁决、瓦片增量清单、跨版要素配对抵消、量化坍缩环裁决、非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -72,6 +74,10 @@ docker compose up -d --build
 - 点选 API（发布数据后即可调用）：
   `GET http://localhost:8000/datasets/{id}/tiles/{z}/{x}/{y}/identify?px=&py=&radius_px=`
   （用法与真实请求 / 响应示例见 [§4.9](#49-点选identify)）
+- 瓦片增量清单 API（发布两个修订后即可调用）：
+  `GET http://localhost:8000/datasets/{id}/tile-diff?from_revision=1&to_revision=2&z=14`
+  ——两版都保留覆盖全球的面、只移动一个局部点时，也只枚举该局部邻瓦片
+  （完整的局部更新复核与真实请求 / 响应示例见 [§4.6](#46-离线瓦片增量清单tile-diff)）
 - SQLite 数据库保存在 Docker 命名卷 `tile-data`（容器内 `/data/tiles.db`），容器重建后数据不丢
 - 默认以 **2 个 uvicorn worker 进程**启动（`VT_WORKERS=2`），两个进程共享同一个
   SQLite 文件；**首次启动建库由跨进程文件锁串行化、并带有界重试**（见
@@ -610,36 +616,82 @@ curl -i -H 'If-None-Match: "75dd0d37d05a70e4ed743cb72731f3bb8f3d0a513cfa58a1b473
 即可完成离线增量更新。端点把两份不可变 GeoJSON 都走一遍既有编译链路，并以**编码后的
 MVT 字节**裁决：
 
-1. **候选集（只增不漏）**：对**两个修订的每个要素**，用与瓦片管线完全相同的 Web
-   Mercator 投影（含 ±85.05112878° 纬度截断）求 mercator 包围盒，并按该 z 下
-   **8 px（128/4096 个瓦片跨度）**向四周外扩，映射为覆盖到的瓦片索引范围后取并集。
-   因此新增、删除、移动、属性变化的要素，以及只通过 **8 px 缓冲**影响到的邻瓦片都在
-   候选范围内；候选完全按几何计算，**无 ID 或重复 ID 的要素也不会漏报**。
-2. **字节裁决（不多报）**：候选瓦片逐块经过投影 → 8 px 缓冲裁剪 → 0.5 px 简化 →
+1. **跨版要素配对（先抵消）**：瓦片字节取决于编译进瓦片的要素*序列*——编码器按排序键
+   （数值 ID → 字符串 ID → 无 ID 按内容哈希）排序，同键者保持**源顺序**，因此同排序键
+   换序会改变 MVT 字节。配对时两版要素先按**编码时使用的同一个排序键**分组，组内严格
+   按源顺序逐个配对（第一个对第一个、第二个对第二个，无 ID 与重复 ID 的要素也一样），
+   只有 **MVT 有效 ID + 规范化属性 + 几何 WKB 三者逐字节一致**的一对才抵消；其余
+   （新增、删除、移动、属性变化、同键换序、成组数量变化）全部留在"未抵消"集合里。
+   抵消要求内容字节级相同且位置保序，因此**不会误抵消、不会漏报**。
+2. **候选集（只增不漏、只编可能变动的区域）**：仅对未抵消要素，用与瓦片管线完全相同
+   的 Web Mercator 投影（含 ±85.05112878° 纬度截断）求 mercator 包围盒，按该 z 下
+   **8 px（128/4096 个瓦片跨度）**向四周外扩并映射为瓦片索引取并集——移动要素的
+   **旧位置与新位置**及其缓冲邻瓦片都在内。两版都保留的要素（哪怕是一个覆盖全球的
+   背景面）被抵消后不贡献任何候选，因此 **z=14 局部更新只枚举该局部邻瓦片，绝不遍历
+   全球 2²⁸ ≈ 2.68 亿个瓦片**。
+3. **字节裁决（不多报）**：候选瓦片逐块经过投影 → 8 px 缓冲裁剪 → 0.5 px 简化 →
    4096 量化 → 稳定排序 → MVT 编码，**两端字节不同才上报**。源 GeoJSON 不同但编码
-   结果相同（如亚网格级抖动、要素重排）不报。
-3. 结果按 **x 升序、再 y 升序**排列；`from_etag` / `to_etag` 与
+   结果相同（如亚网格级抖动、不同排序键的要素重排）不报。
+4. 结果按 **x 升序、再 y 升序**排列；`from_etag` / `to_etag` 与
    `?revision=N` **钉版瓦片接口返回的 ETag 完全一致**（两端共用同一条
    LRU → SQLite `tile_cache` → 确定性编译的取片路径）。
-4. **z=14 不枚举全球**：局部更新只覆盖几何附近的若干邻瓦片（一个点最多影响
-   2×2 块），不会遍历该级别的 2³⁴ 个瓦片。
 
-下面用北京附近的一个点（属性 `open` 由 `true` 改 `false`）、一条道路（中间节点
-微调）和一个新增咖啡馆做示例（先按 [§4.1](#41-发布图层创建数据集revision-1)、
-[§4.2](#42-发布新版本乐观并发控制) 发布 revision 1、2）。
+下面用一个**可直接复现**的局部更新复核：`data/local-update-v1.geojson` 含一个覆盖全球
+的背景面（`id=1`）和一个北京点（`id=2`）；`data/local-update-v2.geojson` 背景面
+**逐字节不变**，只把北京点东移约 30 m（`116.4074` → `116.4077`）。
 
-**请求**（`z=14`，三个参数均必填）：
+**第 1 步：发布两个修订**（启动方式见 [§3](#3-docker-compose-一键启动推荐)）：
+
+```bash
+curl -s -X POST http://localhost:8000/datasets \
+  -F "file=@data/local-update-v1.geojson;type=application/geo+json" \
+  -F "layer=demo"
+```
+
+```json
+{
+    "id": "bc365fb84125461a862ebacfa250d490",
+    "layer": "demo",
+    "revision": 1,
+    "content_hash": "09f778b8e5a71b83af13911b74537277d23c1047cedff5cbafe4c3a96ef968a6",
+    "feature_count": 2,
+    "published_at": "2026-10-05T13:49:24Z"
+}
+```
+
+```bash
+DS=bc365fb84125461a862ebacfa250d490   # 换成实际上一步返回的 id
+
+curl -s -X POST "http://localhost:8000/datasets/$DS/revisions" \
+  -F "file=@data/local-update-v2.geojson;type=application/geo+json" \
+  -F "expected_revision=1"
+```
+
+```json
+{
+    "id": "bc365fb84125461a862ebacfa250d490",
+    "layer": "demo",
+    "revision": 2,
+    "content_hash": "8144a86ef90afaba4d38935921a48ce50da5ceafa3a28b863c4ece669dd31229",
+    "feature_count": 2,
+    "published_at": "2026-10-05T13:49:31Z"
+}
+```
+
+**第 2 步：请求 z=14 增量清单**——全球背景面被配对抵消，候选只剩移动点的旧、新位置
+及其 8 px 缓冲邻瓦片，请求即刻返回（实测约 0.07 s），而不是去遍历 z=14 的全球
+2²⁸ ≈ 2.68 亿个瓦片：
 
 ```bash
 curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=2&z=14" \
   | python3 -m json.tool
 ```
 
-**响应** `200 OK`（仅列出实际字节变化的 4 个相邻 z=14 瓦片，x、y 升序）：
+**响应** `200 OK`（点东移 ~30 m 后仍落在同一瓦片内，故只有 1 块字节变化）：
 
 ```json
 {
-    "dataset_id": "f662e702b8eb456980d7452481e31469",
+    "dataset_id": "bc365fb84125461a862ebacfa250d490",
     "z": 14,
     "from_revision": 1,
     "to_revision": 2,
@@ -647,80 +699,74 @@ curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revisio
         {
             "z": 14,
             "x": 13489,
-            "y": 6207,
-            "from_etag": "\"8ba8454b30a5f0e1fd98803b9d953bee2536637514bbcd583354a57ff5a68202\"",
-            "to_etag": "\"08d0deddbec0bd7247e7760725a47e5b84a3b3f113937c5d7e9502e7b5ce009b\""
-        },
-        {
-            "z": 14,
-            "x": 13489,
             "y": 6208,
-            "from_etag": "\"4ebd015258c6a944f17b85c605be554e1ed63bb109755c51f418c3bd48a36b69\"",
-            "to_etag": "\"6ff02963e1b2a4e41598857a5a127683becf0985764aafc579a06981fbae9beb\""
-        },
-        {
-            "z": 14,
-            "x": 13490,
-            "y": 6207,
-            "from_etag": "\"fb23cb0773a32f5f6b542ff818b1c13509d0d87dec1d26838a8e06fec43295db\"",
-            "to_etag": "\"bc9cb408bb2c82fae4e43a5163ba3f502f88ec3cde907203b06ae29ce6246cc7\""
-        },
-        {
-            "z": 14,
-            "x": 13490,
-            "y": 6208,
-            "from_etag": "\"cc0391a6e59e477238a5dcd8b16902411e5c28f2627b45f20a988a01e6959491\"",
-            "to_etag": "\"243426eb6e8a578f480518e17c22af2b83169a6afeddaa0c66012b4b772e80d0\""
+            "from_etag": "\"0aafec1b4506b8547b1ac7c52b8ecfab21b2eba3120ce338e8d201bb346d76f2\"",
+            "to_etag": "\"c0e5efaf3206ceb8cdeed4cf8a9f721c86021b89d6188e3d9a8e3db8f99a81d5\""
         }
     ]
 }
 ```
 
-**ETag 与钉版瓦片一致**——清单里的 ETag 可直接与钉版瓦片响应头核对：
+**ETag 与钉版瓦片一致**——清单里的两个 ETag 可直接与钉版瓦片响应头核对：
 
 ```bash
 curl -s -D - -o /dev/null \
-  "http://localhost:8000/datasets/$DS/tiles/14/13489/6207.mvt?revision=1"
+  "http://localhost:8000/datasets/$DS/tiles/14/13489/6208.mvt?revision=1"
 ```
 
 ```http
 HTTP/1.1 200 OK
-etag: "8ba8454b30a5f0e1fd98803b9d953bee2536637514bbcd583354a57ff5a68202"
+etag: "0aafec1b4506b8547b1ac7c52b8ecfab21b2eba3120ce338e8d201bb346d76f2"
 x-revision: 1
 cache-control: public, max-age=31536000, immutable
 ```
 
-同一区域在 **z=12** 只落在 2 个瓦片中（缩放级别越低，瓦片越大、清单越短）：
+```bash
+curl -s -D - -o /dev/null \
+  "http://localhost:8000/datasets/$DS/tiles/14/13489/6208.mvt?revision=2" | grep -i etag
+# etag: "c0e5efaf3206ceb8cdeed4cf8a9f721c86021b89d6188e3d9a8e3db8f99a81d5"
+```
+
+同一对修订在 **z=12** 也只报实际变化的 1 块（缩放级别越低瓦片越大，清单越短）：
 
 ```bash
-curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=2&z=12"
+curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=2&z=12" \
+  | python3 -m json.tool
 ```
 
 ```json
 {
-    "dataset_id": "f662e702b8eb456980d7452481e31469",
+    "dataset_id": "bc365fb84125461a862ebacfa250d490",
     "z": 12,
     "from_revision": 1,
     "to_revision": 2,
     "changed_tiles": [
         {
-            "z": 12, "x": 3372, "y": 1551,
-            "from_etag": "\"3ccc98772e5f0a8cfe6dae7c87a1409794cdf23f8323c37a203c890d7e9ec197\"",
-            "to_etag": "\"5d171ff36343ad961d78929dc9cb78816d419c2143b7ff5860da7fa7a63520e0\""
-        },
-        {
-            "z": 12, "x": 3372, "y": 1552,
-            "from_etag": "\"3864b1fd9a3e19f6b764f4140d3ed3d379d33d22a13193b8e7b193173ebb9937\"",
-            "to_etag": "\"e28236a78c24a371e0fb5c213a1e01454668a5cf55301ea80d1a00144db3d3d1\""
+            "z": 12,
+            "x": 3372,
+            "y": 1552,
+            "from_etag": "\"41f62bf0eed781a0c8802246725d7d8e6a5124df5135b88821ee395339d078c4\"",
+            "to_etag": "\"8ab7df2aebce23cc86914ceef5025de0af85e4d74786fbb87ed749be0584df21\""
         }
     ]
 }
 ```
 
+而在 **z=0** 清单为空：30 m 的移动在 0 级（1 网格单位 ≈ 9.8 km）量化后坐标不变，
+两端瓦片逐字节相同——源文档不同但编码相同，不多报：
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=2&z=0"
+```
+
+```json
+{"dataset_id":"bc365fb84125461a862ebacfa250d490","z":0,"from_revision":1,"to_revision":2,"changed_tiles":[]}
+```
+
 **相同修订返回空清单**（不可变修订 + 确定性管线，两端字节必然相同，不枚举任何瓦片）：
 
 ```bash
-curl -s -i "http://localhost:8000/datasets/$DS/tile-diff?from_revision=2&to_revision=2&z=12"
+curl -s -i "http://localhost:8000/datasets/$DS/tile-diff?from_revision=2&to_revision=2&z=14"
 ```
 
 ```http
@@ -729,7 +775,7 @@ content-type: application/json
 ```
 
 ```json
-{"dataset_id":"f662e702b8eb456980d7452481e31469","z":12,"from_revision":2,"to_revision":2,"changed_tiles":[]}
+{"dataset_id":"bc365fb84125461a862ebacfa250d490","z":14,"from_revision":2,"to_revision":2,"changed_tiles":[]}
 ```
 
 **参数 / 存在性错误**：
@@ -738,7 +784,7 @@ content-type: application/json
 # 修订不存在
 curl -s -i "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=9&z=12"
 # HTTP/1.1 404 Not Found
-# {"error":"revision 9 does not exist","dataset_id":"...","latest_revision":2}
+# {"error":"revision 9 does not exist","dataset_id":"bc365fb84125461a862ebacfa250d490","latest_revision":2}
 
 # z 超出 0-14（from_revision/to_revision 缺失、非整数或 < 1 同样返回 400）
 curl -s -i "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=2&z=15"
@@ -1163,10 +1209,13 @@ curl -s -i "http://localhost:8000/datasets/$DS/tiles/0/0/0/identify?px=1&py=1&ra
 ETag 会持久化在 SQLite `tile_cache` 表中，因此重复请求乃至服务进程重启后，
 同一 `(dataset, revision, z, x, y)` 的字节和 ETag 始终一致。
 
-> **增量清单如何选瓦片**：要素只会被编译进“瓦片外扩 8 px 缓冲盒”与其几何相交的
-> 瓦片，因此 tile-diff 把两个修订中每个要素的 Web Mercator 包围盒同样外扩
-> 128/4096 个瓦片跨度（8 px）并映射为瓦片索引、取并集，得到只增不漏的候选集；
-> 随后每个候选仍走上面的完整管线并按编码字节裁决（见
+> **增量清单如何选瓦片**：要素只会被编译进"瓦片外扩 8 px 缓冲盒"与其几何相交的
+> 瓦片。tile-diff 先把两版要素**按编码排序键分组、组内按源顺序配对**，内容（MVT 有效
+> ID + 规范化属性 + 几何 WKB）逐字节一致的一对直接抵消——它们在每个瓦片里产生的字节
+> 完全相同；随后仅对抵消不掉的要素，把其 Web Mercator 包围盒外扩 128/4096 个瓦片跨度
+> （8 px）映射为瓦片索引、取并集，得到只增不漏的候选集。因此两版都保留的全球背景面
+> 不会把一次局部更新放大成全球扫描，而同排序键换序、无 ID / 重复 ID 的要素也不会被
+> 误抵消。每个候选仍走上面的完整管线并按编码字节裁决（见
 > [§4.6](#46-离线瓦片增量清单tile-diff)）。
 
 > 说明：MVT 要素 ID 按协议仅支持非负 uint64 整数；字符串 ID 的要素仍会被

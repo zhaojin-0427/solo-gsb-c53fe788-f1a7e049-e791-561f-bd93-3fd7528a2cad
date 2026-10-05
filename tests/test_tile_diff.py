@@ -2,8 +2,11 @@
 
 The manifest must
 
-* enumerate candidates from *geometry* (so ID-less / duplicate-ID features
-  and 8 px buffer neighbours cannot be missed),
+* match features across the revisions (sort-key groups, source order inside
+  a group, byte-level content signature) and enumerate candidates only from
+  the *unmatched* features' geometry, so an unchanged world-covering polygon
+  cannot trigger a global z=14 scan while ID-less / duplicate-ID features
+  and 8 px buffer neighbours are never missed,
 * adjudicate every candidate by the actually encoded MVT bytes through the
   exact same projection / clip / simplify / quantise / encode pipeline,
 * report ETags identical to the pinned tile endpoint,
@@ -308,6 +311,37 @@ def test_feature_reordering_compiles_to_empty_diff(client):
     assert _diff(client, ds, 1, 2, 3).json()["changed_tiles"] == []
 
 
+def test_same_sort_key_reorder_is_not_falsely_cancelled(client):
+    # Two features share id=7, hence the same sort key; the encoder's stable
+    # sort keeps their *source* order, so swapping them changes the MVT byte
+    # order in tiles where they co-occur.  Matching must not cancel them
+    # across positions -- that would silently drop a real change.
+    f = point(10.0, 10.0, {"name": "f"}, fid=7)
+    g = point(10.4, 10.4, {"name": "g"}, fid=7)
+    ds = _publish_one(client, [f, g])
+    _publish_next(client, ds, [g, f], 1)
+
+    z = 4
+    expected = _brute_force_changed_tiles(client, ds, 1, 2, z)
+    got = {(t["x"], t["y"]) for t in _diff(client, ds, 1, 2, z).json()["changed_tiles"]}
+    assert got == expected
+    assert expected, "reordering same-key features must change some tile bytes"
+
+
+def test_removed_duplicate_idless_feature_is_reported(client):
+    # Two byte-identical ID-less points: one cancels against the kept copy,
+    # the other is unmatched, so dropping the duplicate is reported.
+    f = point(10.0, 10.0, {"k": "v"})
+    ds = _publish_one(client, [f, f])
+    _publish_next(client, ds, [f], 1)
+
+    z = 4
+    expected = _brute_force_changed_tiles(client, ds, 1, 2, z)
+    got = {(t["x"], t["y"]) for t in _diff(client, ds, 1, 2, z).json()["changed_tiles"]}
+    assert got == expected
+    assert expected, "removing one of two identical features changes bytes"
+
+
 def test_added_and_removed_features_appear(client):
     rev1 = [point(10.0, 10.0, fid=1), point(-40.0, 20.0, fid=2)]
     rev2 = [point(10.0, 10.0, fid=1), point(70.0, -30.0, fid=3)]
@@ -434,12 +468,49 @@ def test_candidate_superset_exhaustive_across_zooms():
         assert missed == [], f"z={z}: candidate set missed changed tiles {missed}"
 
 
+def test_candidate_superset_with_same_key_reorder():
+    """Swapping two same-sort-key features changes tile bytes; the candidate
+    set must still cover every changed tile (no false cancellation)."""
+    from app.tiler import compile_tile
+
+    f = {"id": 7, "properties": {"name": "f"},
+         "geometry": shape(point(10.0, 10.0)["geometry"])}
+    g = {"id": 7, "properties": {"name": "g"},
+         "geometry": shape(point(10.4, 10.4)["geometry"])}
+    rev1 = [f, g]
+    rev2 = [g, f]
+
+    changed_any = False
+    for z in range(0, 7):
+        candidates = set(tilediff.candidate_tiles(rev1, rev2, z))
+        for x in range(1 << z):
+            for y in range(1 << z):
+                a = compile_tile({"demo": rev1}, z, x, y)
+                b = compile_tile({"demo": rev2}, z, x, y)
+                if a != b:
+                    changed_any = True
+                    assert (x, y) in candidates, f"z={z}: missed {(x, y)}"
+    assert changed_any
+
+
 def test_candidate_tiles_cover_buffer_neighbours():
     feats = _as_shapely_features([point(NEAR_BOUNDARY_WEST, 10.0, fid=1)])
-    candidates = tilediff.candidate_tiles(feats, feats, 3)
-    # Containing tile (6,3) plus the 8 px buffered neighbour (7,3).
+    # Deleting the point leaves it unmatched, so its footprint is enumerated:
+    # containing tile (6,3) plus the 8 px buffered neighbour (7,3).
+    candidates = tilediff.candidate_tiles(feats, [], 3)
     assert (6, 3) in candidates
     assert (7, 3) in candidates
+
+
+def test_identical_revisions_yield_no_candidates():
+    # Byte-identical revisions cancel completely: nothing may be enumerated,
+    # not even a world-covering polygon's footprint.
+    feats = _as_shapely_features([
+        polygon([[[-180.0, -85.0], [180.0, -85.0], [180.0, 85.0],
+                  [-180.0, 85.0], [-180.0, -85.0]]], {"name": "bg"}, fid=1),
+        point(116.4074, 39.9042, {"name": "bj"}, fid=2),
+    ])
+    assert tilediff.candidate_tiles(feats, feats, 14) == []
 
 
 def test_candidate_tiles_union_both_revisions_and_sorted():
@@ -467,6 +538,59 @@ def test_z14_local_update_enumerates_only_local_neighbourhood(client):
     x = int((lng + 180) / 360 * n)
     for cx, cy in candidates:
         assert abs(cx - x) <= 1
+
+
+# A world-covering background polygon, kept byte-identical in both revisions.
+WORLD_POLYGON = polygon(
+    [[[-180.0, -85.0], [180.0, -85.0], [180.0, 85.0],
+      [-180.0, 85.0], [-180.0, -85.0]]],
+    {"name": "background"},
+    fid=1,
+)
+
+
+def test_z14_world_polygon_cancels_and_local_move_stays_local(client):
+    # Regression for the global scan: both revisions keep a world-covering
+    # polygon and move one local point.  The unchanged polygon must cancel
+    # in the cross-revision match, so only the moved point's old/new
+    # neighbourhoods are enumerated -- never the 2^34-tile global grid.
+    lng, lat = 116.4074, 39.9042
+    rev1 = _as_shapely_features([WORLD_POLYGON, point(lng, lat, {"name": "bj"}, fid=2)])
+    rev2 = _as_shapely_features(
+        [WORLD_POLYGON, point(lng + 0.0003, lat, {"name": "bj"}, fid=2)]
+    )
+
+    candidates = tilediff.candidate_tiles(rev1, rev2, 14)
+    n = 1 << 14
+    assert n * n > 10**8
+    assert 1 <= len(candidates) <= 4
+    x = int((lng + 180) / 360 * n)
+    for cx, cy in candidates:
+        assert abs(cx - x) <= 1
+
+
+def test_z14_endpoint_with_world_polygon_returns_local_manifest(client):
+    # End-to-end over HTTP: the diff of the world-polygon pair above must
+    # come back immediately with only the moved point's tile(s).
+    lng, lat = 116.4074, 39.9042
+    ds = _publish_one(client, [WORLD_POLYGON, point(lng, lat, {"name": "bj"}, fid=2)])
+    _publish_next(
+        client, ds, [WORLD_POLYGON, point(lng + 0.0003, lat, {"name": "bj"}, fid=2)], 1
+    )
+
+    resp = _diff(client, ds, 1, 2, 14)
+    assert resp.status_code == 200
+    changed = resp.json()["changed_tiles"]
+    assert 1 <= len(changed) <= 2
+    assert [(t["x"], t["y"]) for t in changed] == sorted(
+        (t["x"], t["y"]) for t in changed
+    )
+    # Both ETags are exactly those of the pinned tile endpoint.
+    for t in changed:
+        a = client.get(f"/datasets/{ds}/tiles/14/{t['x']}/{t['y']}.mvt?revision=1")
+        b = client.get(f"/datasets/{ds}/tiles/14/{t['x']}/{t['y']}.mvt?revision=2")
+        assert t["from_etag"] == a.headers["etag"]
+        assert t["to_etag"] == b.headers["etag"]
 
 
 def test_z14_endpoint_diff_is_small_for_local_update(client):

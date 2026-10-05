@@ -616,15 +616,21 @@ def get_tile_diff(dataset_id: str, request: Request) -> JSONResponse:
     from_revision, to_revision : positive revision numbers (both must exist)
     z                          : zoom level, 0-14
 
-    The candidate range is derived from the mercator bounds of every feature
-    of both revisions, expanded by the same 8 px buffer used when clipping,
-    so added / removed / moved / attribute-changed features and buffer-only
-    neighbours are all covered (ID-less and duplicate-ID features included).
-    Each candidate is then resolved through the exact projection / clip /
-    simplify / quantise / MVT pipeline and adjudicated by *encoded bytes*:
-    tiles that stay byte-identical even when the source GeoJSON differs are
-    not reported.  ``from_etag`` / ``to_etag`` are the very ETags returned by
-    the pinned tile endpoint.  Results are sorted by ``x`` then ``y``.
+    The candidate range is derived only from features that cannot be
+    cancelled across the two revisions: features are matched inside their
+    exact encode-time sort-key groups, paired in source order (duplicate IDs
+    and ID-less features included), and a pair cancels only when id,
+    properties and geometry are byte-identical.  Unmatched features --
+    added, removed, moved, attribute-changed or reordered ones -- contribute
+    their mercator bounds expanded by the same 8 px buffer used when
+    clipping (old *and* new positions, buffer-only neighbours included),
+    while an unchanged world-covering polygon cancels and never turns a
+    local z=14 update into a global scan.  Each candidate is then resolved
+    through the exact projection / clip / simplify / quantise / MVT pipeline
+    and adjudicated by *encoded bytes*: tiles that stay byte-identical even
+    when the source GeoJSON differs are not reported.  ``from_etag`` /
+    ``to_etag`` are the very ETags returned by the pinned tile endpoint.
+    Results are sorted by ``x`` then ``y``.
     """
     params = request.query_params
     try:
